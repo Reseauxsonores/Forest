@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Forêt ventriloque</title>
+<style>
+  :root {
+    --moss: #14201a;
+    --moss-2: #1d2e24;
+    --lichen: #b5c48f;
+    --fog: #e7ebdf;
+    --bark: #8a735c;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  *, *::before, *::after { box-sizing: inherit; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(ellipse at 50% 38%, var(--moss-2), var(--moss) 70%);
+    color: var(--fog);
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 1.5rem;
+  }
+  main { width: 100%; max-width: 26rem; }
+  h1 {
+    font-weight: 400;
+    font-size: clamp(2.2rem, 10vw, 3.2rem);
+    line-height: 1.05;
+    letter-spacing: -0.01em;
+    margin: 0 0 2.5rem;
+  }
+  .voice { position: relative; width: 12rem; height: 12rem; margin: 0 auto 2rem; }
+  .voice i {
+    position: absolute; inset: 0; border-radius: 50%;
+    border: 1px solid var(--lichen); opacity: .0;
+  }
+  .voice.on i { animation: ring 3.6s ease-out infinite; }
+  .voice.on i:nth-child(2) { animation-delay: 1.2s; }
+  .voice.on i:nth-child(3) { animation-delay: 2.4s; }
+  @keyframes ring { from { transform: scale(.45); opacity: .7; } to { transform: scale(1.35); opacity: 0; } }
+  button {
+    position: absolute; inset: 2.6rem;
+    width: auto; height: auto;
+    border-radius: 50%;
+    border: 1px solid var(--lichen);
+    background: transparent; color: var(--fog);
+    font: inherit; font-size: 1rem; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: rgba(181,196,143,.12); }
+  button:focus-visible { outline: 2px solid var(--lichen); outline-offset: 4px; }
+  button:disabled { border-color: var(--bark); color: var(--bark); cursor: default; }
+  #msg { font-size: 1.15rem; margin: 0 0 .5rem; min-height: 3.4em; }
+  #detail { font-size: .95rem; color: var(--bark); margin: 0; min-height: 1.6em; }
+  @media (prefers-reduced-motion: reduce) { .voice.on i { animation: none; opacity: .35; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Forêt ventriloque</h1>
+  <div class="voice" id="voice"><i></i><i></i><i></i>
+    <button id="btn" type="button">Commencer</button>
+  </div>
+  <p id="msg" aria-live="polite">Touchez le bouton pour activer les capteurs. La voix se fait entendre quand vous marchez, à votre rythme.</p>
+  <p id="detail"></p>
+  <audio id="audio" preload="auto"></audio>
+</main>
+
+<script>
+// ---- Réglages ----
+// Chaque extrait : "src" = fichier audio. Ensuite, au choix :
+//   next: "id"                        -> enchaîne directement sur cet extrait
+//   choices: [{dir, to}, ...]         -> bifurcation : dir = cap en degrés (0 = nord, 90 = est, 180 = sud, 270 = ouest)
+//   rien                              -> fin de l'histoire
+const SEGMENTS = {
+  debut:     { src: "audio/debut.mp3", choices: [ { dir: 90, to: "est" }, { dir: 270, to: "ouest" } ] },
+  est:       { src: "audio/est.mp3",   next: "clairiere" },
+  ouest:     { src: "audio/ouest.mp3", next: "clairiere" },
+  clairiere: { src: "audio/clairiere.mp3" }
+};
+const START = "debut";      // extrait lancé par défaut (un QR code peut en désigner un autre : ?point=est)
+const TOLERANCE = 60;       // degrés : écart maximal entre le cap du marcheur et la direction d'un chemin
+const HEADING_WINDOW = 4000;// ms : durée sur laquelle le cap est moyenné
+const REF_CADENCE = 1.8;    // pas par seconde = lecture à vitesse 1
+const MIN_RATE = 0.6, MAX_RATE = 1.5;
+const STEP_THRESHOLD = 1.0; // m/s² : sensibilité de détection des pas
+const STOP_DELAY = 4000;    // ms sans pas avant la mise en pause
+// -------------------
+
+const $ = id => document.getElementById(id);
+const btn = $("btn"), msg = $("msg"), detail = $("detail"), audio = $("audio"), voice = $("voice");
+let started = false, mode = "idle", current = null, gotMotion = false;
+let steps = [], headings = [], gravity = 9.8, filt = 0, above = false, lastStep = 0;
+audio.preservesPitch = true;
+
+const wanted = new URLSearchParams(location.search).get("point");
+const startId = SEGMENTS[wanted] ? wanted : START;
+const rad = Math.PI / 180;
+const angDiff = (a, b) => Math.abs(((a - b + 540) % 360) - 180);
+
+btn.addEventListener("click", () => {
+  if (started) return;
+  started = true;
+  btn.disabled = true;
+  btn.textContent = "…";
+  msg.textContent = "Activation des capteurs…";
+
+  // Autorisation des capteurs (obligatoire sur iPhone, dans le geste du doigt)
+  const asks = [];
+  if (window.DeviceMotionEvent && DeviceMotionEvent.requestPermission) asks.push(DeviceMotionEvent.requestPermission());
+  if (window.DeviceOrientationEvent && DeviceOrientationEvent.requestPermission) asks.push(DeviceOrientationEvent.requestPermission());
+
+  // Ce premier geste débloque aussi la lecture audio automatique
+  current = startId;
+  audio.src = SEGMENTS[current].src;
+  audio.muted = true;
+  audio.play().then(() => { audio.pause(); audio.currentTime = 0; audio.muted = false; })
+              .catch(() => { audio.muted = false; });
+  try { navigator.wakeLock && navigator.wakeLock.request("screen").catch(() => {}); } catch (e) {}
+
+  Promise.all(asks).then(r => {
+    if (r.some(x => x !== "granted")) throw new Error("refus");
+    startSensors();
+  }).catch(() => {
+    btn.textContent = "Indisponible";
+    msg.textContent = "L’accès aux capteurs est refusé. Autorisez-le dans les réglages du navigateur, puis rechargez la page.";
+  });
+});
+
+function startSensors() {
+  window.addEventListener("devicemotion", onMotion);
+  window.addEventListener("ondeviceorientationabsolute" in window ? "deviceorientationabsolute" : "deviceorientation", onOrient);
+  mode = "playing";
+  setInterval(tick, 500);
+  setTimeout(() => {
+    if (!gotMotion) { btn.textContent = "Indisponible"; msg.textContent = "Aucun capteur de mouvement détecté sur cet appareil."; }
+  }, 4000);
+}
+
+// Détection des pas : pics d'accélération, une fois la gravité retirée
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  gotMotion = true;
+  const m = Math.hypot(a.x, a.y, a.z);
+  gravity += 0.02 * (m - gravity);
+  filt += 0.3 * ((m - gravity) - filt);
+  const now = Date.now();
+  if (filt > STEP_THRESHOLD && !above && now - lastStep > 300) {
+    above = true; lastStep = now;
+    steps.push(now); if (steps.length > 8) steps.shift();
+  } else if (filt < STEP_THRESHOLD * 0.5) above = false;
+}
+
+function cadence() { // pas par seconde, 0 si la personne est à l'arrêt
+  const now = Date.now(), r = steps.filter(t => now - t < STOP_DELAY);
+  if (r.length < 3) return 0;
+  return (r.length - 1) / ((r[r.length - 1] - r[0]) / 1000);
+}
+
+// Cap boussole (0 = nord), corrigé de l'inclinaison du téléphone
+function compassHeading(alpha, beta, gamma) {
+  const a = alpha * rad, b = beta * rad, g = gamma * rad;
+  const rA = -Math.cos(a) * Math.sin(g) - Math.sin(a) * Math.sin(b) * Math.cos(g);
+  const rB = -Math.sin(a) * Math.sin(g) + Math.cos(a) * Math.sin(b) * Math.cos(g);
+  return (Math.atan2(rA, rB) / rad + 360) % 360;
+}
+
+function onOrient(e) {
+  let h = null;
+  if (typeof e.webkitCompassHeading === "number") h = e.webkitCompassHeading;           // iPhone
+  else if (e.alpha != null && e.absolute) h = compassHeading(e.alpha, e.beta, e.gamma);  // Android
+  if (h === null) return;
+  const now = Date.now();
+  headings.push({ t: now, h });
+  headings = headings.filter(x => now - x.t < 10000);
+}
+
+function avgHeading() { // moyenne circulaire des derniers instants
+  const now = Date.now(), r = headings.filter(x => now - x.t < HEADING_WINDOW);
+  if (r.length < 5) return null;
+  let s = 0, c = 0;
+  r.forEach(x => { s += Math.sin(x.h * rad); c += Math.cos(x.h * rad); });
+  return (Math.atan2(s, c) / rad + 360) % 360;
+}
+
+function goTo(id) {
+  current = id;
+  mode = "playing";
+  audio.src = SEGMENTS[id].src;
+  tick();
+}
+
+function tick() {
+  if (mode !== "playing" && mode !== "choosing") return;
+  const cad = cadence(), walking = cad > 0, h = avgHeading();
+  detail.textContent = (h !== null ? "Cap : " + Math.round(h) + "°" : "Cap : —") +
+                       (walking ? " · " + cad.toFixed(1).replace(".", ",") + " pas/s" : "");
+
+  if (mode === "playing") {
+    if (walking) {
+      const rate = Math.min(MAX_RATE, Math.max(MIN_RATE, cad / REF_CADENCE));
+      audio.defaultPlaybackRate = rate;
+      audio.playbackRate = rate;
+      btn.textContent = "En marche";
+      msg.textContent = "Vous marchez : la voix suit votre pas.";
+      if (audio.paused) audio.play().catch(() => { msg.textContent = "Touchez l’écran pour autoriser le son, puis marchez."; });
+    } else {
+      btn.textContent = "À l’arrêt";
+      msg.textContent = "Marchez pour entendre la voix.";
+      if (!audio.paused) audio.pause();
+    }
+    return;
+  }
+
+  // Bifurcation : le chemin est choisi d'après le cap de la marche
+  btn.textContent = "Bifurcation";
+  msg.textContent = h === null && walking
+    ? "Boussole indisponible : impossible de lire votre direction."
+    : "Choisissez un chemin : marchez dans sa direction.";
+  if (!walking || h === null) return;
+  let best = null, bestD = TOLERANCE + 1;
+  SEGMENTS[current].choices.forEach(c => {
+    const d = angDiff(h, c.dir);
+    if (d < bestD) { bestD = d; best = c; }
+  });
+  if (best) goTo(best.to);
+}
+
+audio.addEventListener("play", () => voice.classList.add("on"));
+audio.addEventListener("pause", () => voice.classList.remove("on"));
+audio.addEventListener("ended", () => {
+  voice.classList.remove("on");
+  const seg = SEGMENTS[current];
+  if (seg.next) return goTo(seg.next);
+  if (seg.choices) { mode = "choosing"; tick(); return; }
+  mode = "done";
+  btn.textContent = "Terminé";
+  msg.textContent = "L’histoire est finie. Rechargez la page pour la réécouter.";
+});
+</script>
+</body>
+</html>
