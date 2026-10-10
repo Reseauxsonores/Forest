@@ -76,18 +76,18 @@
 <script>
 // ---- Réglages ----
 // Chaque zone : un point GPS, un rayon (m) et un fichier son. Le son se lance à l'entrée dans la zone.
-// Si des zones se chevauchent, la plus petite l'emporte.
+// Si des zones se chevauchent : le son de la zone qu'on vient d'entrer prend la place du précédent.
 const ZONES = [
-  { id: "foret", name: "Forêt ventriloque", lat: 46.528250, lon: 6.610889, radius: 10, src: "foret-ventriloque.mp4" }, // 46°31'41.7"N 6°36'39.2"E
-  { id: "zone2", name: "Zone 2", lat: 46.528389, lon: 6.610528, radius: 10, src: "zone2.mp4" },  // 46°31'42.2"N 6°36'37.9"E
-  { id: "zone3", name: "Zone 3", lat: 46.528111, lon: 6.611194, radius: 10, src: "zone3.mp4" }   // 46°31'41.2"N 6°36'40.3"E
+  { id: "fv1", name: "Forêt ventriloque 1", lat: 46.279639, lon: 7.084250, radius: 70, src: "foret-ventriloque1.mp3" }, // 46°16'46.7"N 7°05'03.3"E
+  { id: "fv2", name: "Forêt ventriloque 2", lat: 46.279083, lon: 7.082361, radius: 70, src: "foret-ventriloque2.mp3" }, // 46°16'44.7"N 7°04'56.5"E
+  { id: "fv3", name: "Forêt ventriloque 3", lat: 46.279667, lon: 7.081611, radius: 70, src: "foret-ventriloque3.mp3" }  // 46°16'46.8"N 7°04'53.8"E
 ];
 const WALK_CONTROLS = true; // true : le son ne joue qu'en marchant, et la vitesse de marche règle la lecture
 const MIN_SPEED = 0.6;      // m/s : en dessous, la personne est à l'arrêt
 const REF_SPEED = 1.3;      // m/s : allure normale = lecture à vitesse 1
 const MIN_RATE = 0.6, MAX_RATE = 1.5;
 const STOP_DELAY = 3000;    // ms d'arrêt avant la pause
-const EXIT_MARGIN = 5;      // m : marge à la sortie d'une zone, pour éviter les coupures dues au GPS
+const EXIT_MARGIN = 10;     // m : marge à la sortie d'une zone, pour éviter les coupures dues au GPS
 // -------------------
 
 const $ = id => document.getElementById(id);
@@ -95,13 +95,16 @@ const btn = $("btn"), msg = $("msg"), detail = $("detail"), voice = $("voice");
 let started = false, active = null, smooth = 0, lastPos = null, lastMove = 0, fixed = false;
 const finished = new Set();
 
-// Un lecteur par zone, préchargé : le passage d'une zone à l'autre est immédiat
-ZONES.forEach(z => {
-  z.audio = new Audio(z.src);
-  z.audio.preload = "auto";
-  z.audio.preservesPitch = true;
-  z.audio.addEventListener("ended", () => { finished.add(z.id); apply(); });
-});
+// Un seul lecteur, débloqué au premier tap : c'est ce qui fonctionne le mieux sur iPhone
+const audio = new Audio();
+audio.preload = "auto";
+audio.preservesPitch = true;
+const SILENCE = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+let broken = false;
+const isZoneSound = () => active && !audio.src.startsWith("data:");
+audio.addEventListener("ended", () => { if (isZoneSound()) { finished.add(active.id); apply(); } });
+audio.addEventListener("error", () => { if (isZoneSound()) { broken = true; apply(); } });
+document.addEventListener("click", () => { if (started) apply(); }); // un toucher relance le son s'il a été bloqué
 
 function distanceM(lat1, lon1, lat2, lon2) {
   const R = 6371000, rad = Math.PI / 180;
@@ -119,12 +122,9 @@ btn.addEventListener("click", () => {
   btn.disabled = true;
   btn.textContent = "…";
   msg.textContent = "Recherche de votre position…";
-  // Ce premier geste débloque la lecture automatique de tous les sons
-  ZONES.forEach(z => {
-    z.audio.muted = true;
-    z.audio.play().then(() => { z.audio.pause(); z.audio.currentTime = 0; z.audio.muted = false; })
-                  .catch(() => { z.audio.muted = false; });
-  });
+  // Ce premier geste débloque la lecture automatique des sons
+  audio.src = SILENCE;
+  audio.play().then(() => audio.pause()).catch(() => {});
   try { navigator.wakeLock && navigator.wakeLock.request("screen").catch(() => {}); } catch (e) {}
   navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
   setInterval(tick, 1000);
@@ -133,16 +133,23 @@ btn.addEventListener("click", () => {
 function onPos(p) {
   const { latitude: la, longitude: lo, accuracy, speed } = p.coords;
   fixed = true;
-  ZONES.forEach(z => { z.d = distanceM(la, lo, z.lat, z.lon); });
+  ZONES.forEach(z => {
+    z.d = distanceM(la, lo, z.lat, z.lon);
+    const was = !!z.inside;                                   // marge à la sortie : évite les va-et-vient dus au GPS
+    z.inside = z.d <= z.radius || (was && z.d <= z.radius + EXIT_MARGIN);
+    z.entered = z.inside && !was;
+  });
 
-  // Choix de la zone : la plus petite zone contenant la position, avec marge à la sortie
-  let best = null;
-  ZONES.forEach(z => { if (z.d <= z.radius && (!best || z.radius < best.radius)) best = z; });
-  if (!best && active && active.d <= active.radius + EXIT_MARGIN) best = active;
+  // Choix de la zone : celle qu'on vient d'entrer, sinon celle en cours, sinon la plus proche parmi celles où l'on se trouve
+  const nearest = list => list.reduce((m, z) => (!m || z.d < m.d) ? z : m, null);
+  let best = nearest(ZONES.filter(z => z.entered));
+  if (!best && active && active.inside) best = active;
+  if (!best) best = nearest(ZONES.filter(z => z.inside));
   if (best !== active) {
-    if (active) { active.audio.pause(); active.audio.currentTime = 0; }
+    audio.pause();
     active = best;
-    if (active) { finished.delete(active.id); active.audio.currentTime = 0; lastMove = Date.now(); }
+    broken = false;
+    if (active) { finished.delete(active.id); audio.src = active.src; lastMove = Date.now(); }
   }
 
   // Vitesse : celle du GPS, sinon calculée entre deux positions
@@ -166,7 +173,7 @@ function tick() {
 
 function apply() {
   if (!fixed) return;
-  ZONES.forEach(z => { if (z !== active && !z.audio.paused) z.audio.pause(); });
+  if (!active && !audio.paused) audio.pause();
 
   if (!active) {
     voice.classList.remove("on");
@@ -176,7 +183,13 @@ function apply() {
     msg.textContent = "Prochaine zone : « " + n.name + " », à " + fmt(Math.max(0, n.d - n.radius)) + ".";
     return;
   }
-  const a = active.audio, now = Date.now();
+  const a = audio, now = Date.now();
+  if (broken) {
+    voice.classList.remove("on");
+    btn.textContent = "Erreur";
+    msg.textContent = "Fichier son introuvable ou illisible : " + active.src;
+    return;
+  }
   if (finished.has(active.id)) {
     voice.classList.remove("on");
     btn.textContent = "Terminé";
@@ -192,7 +205,10 @@ function apply() {
     }
     btn.textContent = WALK_CONTROLS ? "En marche" : "À l’écoute";
     msg.textContent = "« " + active.name + " »" + (WALK_CONTROLS ? " : la voix suit votre pas." : ".");
-    if (a.paused) a.play().catch(() => { msg.textContent = "Touchez l’écran pour autoriser le son."; });
+    if (a.paused) a.play().catch(e => {
+      if (e.name === "NotAllowedError") msg.textContent = "Touchez l’écran pour autoriser le son.";
+      else if (e.name !== "AbortError") msg.textContent = "Lecture impossible (" + e.name + ") : " + active.src;
+    });
     voice.classList.add("on");
   } else {
     btn.textContent = "À l’arrêt";
