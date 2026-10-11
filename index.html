@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>Forêt ventriloque</title>
+<title>La voix de la forêt</title>
 <style>
   :root {
     --moss: #14201a;
@@ -38,7 +38,7 @@
     letter-spacing: -0.01em;
     margin: 0 0 2.5rem;
   }
-  .voice { position: relative; width: 12rem; height: 12rem; margin: 0 auto 2rem; }
+  .voice { position: relative; width: 15rem; height: 15rem; margin: 0 auto 2rem; }
   .voice i {
     position: absolute; inset: 0; border-radius: 50%;
     border: 1px solid var(--lichen); opacity: .0;
@@ -48,7 +48,7 @@
   .voice.on i:nth-child(3) { animation-delay: 2.4s; }
   @keyframes ring { from { transform: scale(.45); opacity: .7; } to { transform: scale(1.35); opacity: 0; } }
   button {
-    position: absolute; inset: 2.6rem;
+    position: absolute; inset: 1.6rem; padding: 0 1.3rem; line-height: 1.3;
     width: auto; height: auto;
     border-radius: 50%;
     border: 1px solid var(--lichen);
@@ -65,11 +65,11 @@
 </head>
 <body>
 <main>
-  <h1>Forêt ventriloque</h1>
+  <h1>La voix de la forêt</h1>
   <div class="voice" id="voice"><i></i><i></i><i></i>
-    <button id="btn" type="button">Commencer</button>
+    <button id="btn" type="button">Commencer à écouter</button>
   </div>
-  <p id="msg" aria-live="polite">Touchez le bouton pour activer votre position. La voix se fait entendre quand vous marchez dans la forêt.</p>
+  <p id="msg" aria-live="polite">Touchez le bouton pour activer votre position. Parcourez les chemins pour entendre la suite.</p>
   <p id="detail"></p>
 </main>
 
@@ -82,23 +82,22 @@ const ZONES = [
   { id: "fv2", name: "Forêt ventriloque 2", lat: 46.279083, lon: 7.082361, radius: 70, src: "foret-ventriloque2.mp3" }, // 46°16'44.7"N 7°04'56.5"E
   { id: "fv3", name: "Forêt ventriloque 3", lat: 46.279667, lon: 7.081611, radius: 70, src: "foret-ventriloque3.mp3" }  // 46°16'46.8"N 7°04'53.8"E
 ];
-const WALK_CONTROLS = true; // true : le son ne joue qu'en marchant, et la vitesse de marche règle la lecture
-const MIN_SPEED = 0.6;      // m/s : en dessous, la personne est à l'arrêt
-const REF_SPEED = 1.3;      // m/s : allure normale = lecture à vitesse 1
-const MIN_RATE = 0.6, MAX_RATE = 1.5;
-const STOP_DELAY = 3000;    // ms d'arrêt avant la pause
-const EXIT_MARGIN = 10;     // m : marge à la sortie d'une zone, pour éviter les coupures dues au GPS
+const STILL_PAUSE = true;     // true : le son s'arrête si la personne ne bouge plus
+const CHECK_INTERVAL = 20000; // ms : toutes les 20 s, on regarde si la personne a avancé
+const MIN_MOVE = 5;           // m : déplacement minimal entre deux contrôles pour que la lecture continue
+const BLIND_LIMIT = 40000;    // ms : sans aucune position GPS pendant ce délai, la lecture s'arrête
+const EXIT_MARGIN = 10;       // m : marge à la sortie d'une zone, pour éviter les coupures dues au GPS
 // -------------------
 
 const $ = id => document.getElementById(id);
 const btn = $("btn"), msg = $("msg"), detail = $("detail"), voice = $("voice");
-let started = false, active = null, smooth = 0, lastPos = null, lastMove = 0, fixed = false;
+let started = false, active = null, fixed = false;
+let pos = null, anchor = null, moving = true, lastCheck = 0;
 const finished = new Set();
 
 // Un seul lecteur, débloqué au premier tap : c'est ce qui fonctionne le mieux sur iPhone
 const audio = new Audio();
 audio.preload = "auto";
-audio.preservesPitch = true;
 const SILENCE = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 let broken = false;
 const isZoneSound = () => active && !audio.src.startsWith("data:");
@@ -126,13 +125,21 @@ btn.addEventListener("click", () => {
   audio.src = SILENCE;
   audio.play().then(() => audio.pause()).catch(() => {});
   try { navigator.wakeLock && navigator.wakeLock.request("screen").catch(() => {}); } catch (e) {}
-  navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
+  navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, maximumAge: 2000, timeout: 30000 });
   setInterval(tick, 1000);
 });
 
+// Repart de la position actuelle : la lecture est autorisée pendant les 20 s suivantes
+function startMotion() {
+  anchor = { la: pos.la, lo: pos.lo, t: pos.t };
+  moving = true;
+  lastCheck = Date.now();
+}
+
 function onPos(p) {
-  const { latitude: la, longitude: lo, accuracy, speed } = p.coords;
+  const { latitude: la, longitude: lo, accuracy } = p.coords;
   fixed = true;
+  pos = { la, lo, t: Date.now() };
   ZONES.forEach(z => {
     z.d = distanceM(la, lo, z.lat, z.lon);
     const was = !!z.inside;                                   // marge à la sortie : évite les va-et-vient dus au GPS
@@ -149,25 +156,35 @@ function onPos(p) {
     audio.pause();
     active = best;
     broken = false;
-    if (active) { finished.delete(active.id); audio.src = active.src; lastMove = Date.now(); }
+    if (active) { finished.delete(active.id); audio.src = active.src; startMotion(); }
   }
 
-  // Vitesse : celle du GPS, sinon calculée entre deux positions
-  const t = p.timestamp;
-  let v = (typeof speed === "number" && !isNaN(speed)) ? speed : null;
-  if (v === null && lastPos) {
-    const dt = (t - lastPos.t) / 1000;
-    const moved = distanceM(lastPos.la, lastPos.lo, la, lo);
-    v = (dt > 0.5 && moved > accuracy * 0.5) ? moved / dt : 0;
-  }
-  lastPos = { la, lo, t: Date.now() };
-  if (v !== null) smooth = 0.6 * smooth + 0.4 * Math.min(v, 3);
+  if (!anchor) startMotion();
+  else if (active && !moving && distanceM(anchor.la, anchor.lo, la, lo) >= MIN_MOVE) startMotion(); // la personne repart
+
   detail.textContent = "Précision du GPS : environ " + Math.round(accuracy) + " m";
   apply();
 }
 
+// Toutes les 20 s : la personne a-t-elle avancé d'au moins 5 m depuis le dernier contrôle ?
+function doCheck() {
+  const now = Date.now();
+  lastCheck = now;
+  if (!pos || !anchor || !active) return;
+  if (pos.t === anchor.t || now - pos.t > CHECK_INTERVAL) {   // pas de position récente : le GPS a besoin de temps
+    if (now - pos.t > BLIND_LIMIT) moving = false;
+    return;
+  }
+  if (distanceM(anchor.la, anchor.lo, pos.la, pos.lo) >= MIN_MOVE) {
+    moving = true;
+    anchor = { la: pos.la, lo: pos.lo, t: pos.t };
+  } else {
+    moving = false;
+  }
+}
+
 function tick() {
-  if (lastPos && Date.now() - lastPos.t > 4000) smooth *= 0.7; // sans nouvelle position, la vitesse retombe
+  if (fixed && Date.now() - lastCheck >= CHECK_INTERVAL) doCheck();
   apply();
 }
 
@@ -183,7 +200,6 @@ function apply() {
     msg.textContent = "Prochaine zone : « " + n.name + " », à " + fmt(Math.max(0, n.d - n.radius)) + ".";
     return;
   }
-  const a = audio, now = Date.now();
   if (broken) {
     voice.classList.remove("on");
     btn.textContent = "Erreur";
@@ -196,29 +212,24 @@ function apply() {
     msg.textContent = "« " + active.name + " » est terminée. Avancez vers la zone suivante.";
     return;
   }
-  if (smooth >= MIN_SPEED) lastMove = now;
-  const walking = !WALK_CONTROLS || now - lastMove < STOP_DELAY;
-  if (walking) {
-    if (WALK_CONTROLS) {
-      const rate = Math.min(MAX_RATE, Math.max(MIN_RATE, smooth / REF_SPEED));
-      a.defaultPlaybackRate = rate; a.playbackRate = rate;
-    }
-    btn.textContent = WALK_CONTROLS ? "En marche" : "À l’écoute";
-    msg.textContent = "« " + active.name + " »" + (WALK_CONTROLS ? " : la voix suit votre pas." : ".");
-    if (a.paused) a.play().catch(e => {
+  if (!STILL_PAUSE || moving) {
+    btn.textContent = "À l’écoute";
+    msg.textContent = "« " + active.name + " » : continuez d’avancer pour entendre la suite.";
+    if (audio.paused) audio.play().catch(e => {
       if (e.name === "NotAllowedError") msg.textContent = "Touchez l’écran pour autoriser le son.";
       else if (e.name !== "AbortError") msg.textContent = "Lecture impossible (" + e.name + ") : " + active.src;
     });
     voice.classList.add("on");
   } else {
-    btn.textContent = "À l’arrêt";
-    msg.textContent = "« " + active.name + " » : marchez pour entendre la voix.";
-    if (!a.paused) a.pause();
+    btn.textContent = "En pause";
+    msg.textContent = "« " + active.name + " » : avancez pour entendre la suite.";
+    if (!audio.paused) audio.pause();
     voice.classList.remove("on");
   }
 }
 
 function onErr(e) {
+  if (e.code !== 1 && fixed) return; // perte passagère du signal : on garde la dernière position
   btn.textContent = "Indisponible";
   msg.textContent = e.code === 1
     ? "La position est refusée. Autorisez-la dans les réglages du navigateur, puis rechargez la page."
