@@ -75,12 +75,23 @@
 
 <script>
 // ---- Réglages ----
-// Chaque zone : un point GPS, un rayon (m) et un fichier son. Le son se lance à l'entrée dans la zone.
+// Chaque zone : un polygone GeoJSON (ou un point GPS + rayon en m) et un fichier son. Le son se lance à l'entrée dans la zone.
 // Si des zones se chevauchent : le son de la zone qu'on vient d'entrer prend la place du précédent.
 const ZONES = [
-  { id: "fv1", name: "Forêt ventriloque 1", lat: 46.279639, lon: 7.084250, radius: 70, src: "foret-ventriloque1.mp3" }, // 46°16'46.7"N 7°05'03.3"E
-  { id: "fv2", name: "Forêt ventriloque 2", lat: 46.279083, lon: 7.082361, radius: 70, src: "foret-ventriloque2.mp3" }, // 46°16'44.7"N 7°04'56.5"E
-  { id: "fv3", name: "Forêt ventriloque 3", lat: 46.279667, lon: 7.081611, radius: 70, src: "foret-ventriloque3.mp3" }  // 46°16'46.8"N 7°04'53.8"E
+  {
+    id: "fv1", name: "Forêt ventriloque 1", src: "foret-ventriloque1.mp3",
+    // Polygone tracé dans geojson.io (ordre GeoJSON : longitude, latitude)
+    polygon: [[6.6890444,46.5651495],[6.6886544,46.5651338],[6.6875528,46.568846],[6.6862793,46.56939],[6.6842058,46.5697125],[6.6843447,46.5700618],[6.6847687,46.5700543],[6.6873581,46.5695386],[6.6880504,46.5690436],[6.6884103,46.5678777],[6.6889794,46.5654237],[6.6890444,46.5651495]]
+  }
+  ,
+  {
+    id: "fv2", name: "Forêt ventriloque 2", src: "foret-ventriloque2.mp3",
+    polygon: [[6.6843315,46.5700859],[6.6842961,46.5700149],[6.6841988,46.5697796],[6.6835408,46.5702624],[6.68347,46.5704936],[6.6829563,46.5710026],[6.6833482,46.571571],[6.6840816,46.5727954],[6.6851057,46.5741492],[6.6858817,46.5744676],[6.6859443,46.5743084],[6.6859255,46.5740417],[6.6854562,46.5737621],[6.6847365,46.572622],[6.6839291,46.571091],[6.6842692,46.570346],[6.6843315,46.5700859]]
+  },
+  {
+    id: "fv3", name: "Forêt ventriloque 3", src: "foret-ventriloque3.mp3",
+    polygon: [[6.6843523,46.5700856],[6.6842964,46.5703545],[6.684356,46.5705517],[6.6848076,46.5709858],[6.6851122,46.5714631],[6.6857578,46.5718818],[6.685904,46.5723508],[6.6857213,46.5728198],[6.686306,46.5735316],[6.6859451,46.5740265],[6.6859718,46.5743117],[6.6861485,46.5743915],[6.6863652,46.5742347],[6.6865761,46.5738388],[6.6868555,46.5734665],[6.6864792,46.5726591],[6.6865191,46.5722711],[6.6863119,46.57158],[6.6851946,46.5705475],[6.6847256,46.5700837],[6.6843523,46.5700856]]
+  }
 ];
 const STILL_PAUSE = true;     // true : le son s'arrête si la personne ne bouge plus
 const CHECK_INTERVAL = 20000; // ms : toutes les 20 s, on regarde si la personne a avancé
@@ -94,6 +105,28 @@ const btn = $("btn"), msg = $("msg"), detail = $("detail"), voice = $("voice");
 let started = false, active = null, fixed = false;
 let pos = null, anchor = null, moving = true, lastCheck = 0;
 const finished = new Set();
+
+// Distance (m) entre la position et la zone polygonale : 0 si la position est dedans
+function polyOut(poly, la, lo) {
+  const kx = 111320 * Math.cos(la * Math.PI / 180), ky = 110574;
+  const pts = poly.map(p => [(p[0] - lo) * kx, (p[1] - la) * ky]); // mètres, la position est à l'origine
+  let inside = false, best = Infinity;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+    if ((yi > 0) !== (yj > 0) && 0 < (xj - xi) * (0 - yi) / (yj - yi) + xi) inside = !inside;
+    const dx = xj - xi, dy = yj - yi, l2 = dx * dx + dy * dy;
+    const t = l2 ? Math.max(0, Math.min(1, -(xi * dx + yi * dy) / l2)) : 0;
+    best = Math.min(best, Math.hypot(xi + t * dx, yi + t * dy));
+  }
+  return inside ? 0 : best;
+}
+// Centre approximatif d'un polygone : sert à départager deux zones qui se chevauchent
+ZONES.forEach(z => {
+  if (!z.polygon) return;
+  const p = z.polygon.slice(0, -1);
+  z.lon = p.reduce((a, c) => a + c[0], 0) / p.length;
+  z.lat = p.reduce((a, c) => a + c[1], 0) / p.length;
+});
 
 // Un seul lecteur, débloqué au premier tap : c'est ce qui fonctionne le mieux sur iPhone
 const audio = new Audio();
@@ -142,8 +175,9 @@ function onPos(p) {
   pos = { la, lo, t: Date.now() };
   ZONES.forEach(z => {
     z.d = distanceM(la, lo, z.lat, z.lon);
+    z.out = z.polygon ? polyOut(z.polygon, la, lo) : Math.max(0, z.d - z.radius); // distance au bord (0 = dedans)
     const was = !!z.inside;                                   // marge à la sortie : évite les va-et-vient dus au GPS
-    z.inside = z.d <= z.radius || (was && z.d <= z.radius + EXIT_MARGIN);
+    z.inside = z.out === 0 || (was && z.out <= EXIT_MARGIN);
     z.entered = z.inside && !was;
   });
 
@@ -196,8 +230,8 @@ function apply() {
     voice.classList.remove("on");
     btn.textContent = "Hors zone";
     let n = null;
-    ZONES.forEach(z => { if (!n || z.d - z.radius < n.d - n.radius) n = z; });
-    msg.textContent = "Prochaine zone : « " + n.name + " », à " + fmt(Math.max(0, n.d - n.radius)) + ".";
+    ZONES.forEach(z => { if (!n || z.out < n.out) n = z; });
+    msg.textContent = "Prochaine zone : « " + n.name + " », à " + fmt(n.out) + ".";
     return;
   }
   if (broken) {
